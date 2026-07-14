@@ -593,10 +593,23 @@
       return btn;
     }
 
-    function onSeatClick(num) {
+    async function onSeatClick(num) {
       selectedSeat = num;
       renderRows();
       renderPanel();
+      if (seats[num]) {
+        try {
+          const latestName = await fetchSeatName(num);
+          if (latestName) {
+            seats[num] = { name: latestName };
+            if (selectedSeat === num) {
+              renderPanel();
+            }
+          }
+        } catch (e) {
+          console.error("Error refreshing seat name on click:", e);
+        }
+      }
     }
 
     function renderPanel() {
@@ -670,44 +683,66 @@
       el.classList.toggle('err', !!isErr);
     }
 
-    function serializeSeats(seatsObj) {
-      const parts = [];
-      for (const num in seatsObj) {
-        if (seatsObj[num] && seatsObj[num].name) {
-          const safeName = seatsObj[num].name.replace(/[-_]/g, ' ').trim();
-          parts.push(`${num}-${encodeURIComponent(safeName)}`);
-        }
-      }
-      return parts.join('_');
-    }
-
-    function parseSeatsString(str) {
-      const result = {};
-      if (!str || str === '""' || str === '[]' || str === '{}') return result;
-      if (str.startsWith('"') && str.endsWith('"')) {
-        str = str.slice(1, -1);
-      }
-      if (!str) return result;
-      const parts = str.split('_');
-      parts.forEach(part => {
-        const firstDash = part.indexOf('-');
-        if (firstDash !== -1) {
-          const num = part.substring(0, firstDash);
-          const name = part.substring(firstDash + 1);
-          if (num && name) {
-            result[num] = { name: decodeURIComponent(name) };
+    async function fetchSeatName(num) {
+      try {
+        const res = await fetch(`${API_URL}/GetValue/${APP_KEY}/${STORAGE_KEY}_${num}`);
+        if (res.ok) {
+          const rawData = await res.json();
+          if (rawData && rawData !== '""' && rawData !== '[]' && rawData !== '{}') {
+            let val = rawData;
+            if (val.startsWith('"') && val.endsWith('"')) {
+              val = val.slice(1, -1);
+            }
+            return val.trim();
           }
         }
-      });
-      return result;
+      } catch (e) {
+        console.error(`Error loading seat ${num}`, e);
+      }
+      return null;
     }
 
     async function loadSeatsQuietly() {
       try {
-        const res = await fetch(`${API_URL}/GetValue/${APP_KEY}/${STORAGE_KEY}`);
+        const res = await fetch(`${API_URL}/GetValue/${APP_KEY}/${STORAGE_KEY}_list`);
         if (res.ok) {
           const rawData = await res.json();
-          seats = parseSeatsString(rawData);
+          let listStr = rawData;
+          if (listStr.startsWith('"') && listStr.endsWith('"')) {
+            listStr = listStr.slice(1, -1);
+          }
+          if (listStr === '[]' || listStr === '{}' || !listStr) {
+            listStr = '';
+          }
+          
+          const bookedNums = listStr ? listStr.split('_').map(Number).filter(n => !isNaN(n) && n > 0) : [];
+          
+          // Remove seats from cache that are no longer booked
+          for (const num in seats) {
+            if (!bookedNums.includes(Number(num))) {
+              delete seats[num];
+            }
+          }
+          
+          // Fetch names for newly booked seats
+          const fetchPromises = [];
+          bookedNums.forEach(num => {
+            if (!seats[num]) {
+              fetchPromises.push(
+                fetchSeatName(num).then(name => {
+                  if (name) {
+                    seats[num] = { name };
+                  } else {
+                    seats[num] = { name: "Booked" };
+                  }
+                })
+              );
+            }
+          });
+          
+          if (fetchPromises.length > 0) {
+            await Promise.all(fetchPromises);
+          }
         }
       } catch (e) {
         console.error("Load seats error", e);
@@ -742,22 +777,6 @@
       }
     }
 
-    async function persistSeats(serializedStr) {
-      const res = await fetch(`${API_URL}/UpdateValue/${APP_KEY}/${STORAGE_KEY}/${encodeURIComponent(serializedStr)}`, {
-        method: 'POST',
-        headers: {
-          'Content-Length': '0'
-        }
-      });
-      if (!res.ok) {
-        throw new Error("HTTP error: " + res.status);
-      }
-      const data = await res.text();
-      if (data !== "true") {
-        throw new Error("Failed to write to KV store: " + data);
-      }
-    }
-
     async function saveBooking() {
       const input = document.getElementById('nameInput');
       const name = input.value.trim();
@@ -768,18 +787,43 @@
 
       showPanelStatus('Saving booking...', false);
       try {
-        await loadSeatsQuietly();
-        if (seats[selectedSeat] && !isAdmin) {
-          showPanelStatus(`Seat ${selectedSeat} was just booked by ${seats[selectedSeat].name} on another device.`, true);
-          renderRows();
-          updateStub();
-          return;
+        const safeName = name.replace(/[-_]/g, ' ').trim();
+        const resName = await fetch(`${API_URL}/UpdateValue/${APP_KEY}/${STORAGE_KEY}_${selectedSeat}/${encodeURIComponent(safeName)}`, {
+          method: 'POST',
+          headers: { 'Content-Length': '0' }
+        });
+        if (!resName.ok) {
+          throw new Error("HTTP error saving name: " + resName.status);
         }
 
-        seats[selectedSeat] = { name };
-        const serialized = serializeSeats(seats);
-        await persistSeats(serialized);
+        // Get latest list, merge new booking, save back
+        let bookedNums = [];
+        const resList = await fetch(`${API_URL}/GetValue/${APP_KEY}/${STORAGE_KEY}_list`);
+        if (resList.ok) {
+          let listStr = await resList.json();
+          if (listStr.startsWith('"') && listStr.endsWith('"')) {
+            listStr = listStr.slice(1, -1);
+          }
+          if (listStr && listStr !== '[]' && listStr !== '{}') {
+            bookedNums = listStr.split('_').map(Number).filter(n => !isNaN(n) && n > 0);
+          }
+        }
+        
+        if (!bookedNums.includes(selectedSeat)) {
+          bookedNums.push(selectedSeat);
+        }
+        bookedNums.sort((a, b) => a - b);
+        const newListStr = bookedNums.join('_');
+        
+        const resUpdateList = await fetch(`${API_URL}/UpdateValue/${APP_KEY}/${STORAGE_KEY}_list/${encodeURIComponent(newListStr)}`, {
+          method: 'POST',
+          headers: { 'Content-Length': '0' }
+        });
+        if (!resUpdateList.ok) {
+          throw new Error("HTTP error updating list: " + resUpdateList.status);
+        }
 
+        seats[selectedSeat] = { name: safeName };
         renderRows();
         updateStub();
         showPanelStatus('Booking saved.', false);
@@ -792,11 +836,37 @@
     async function clearBooking() {
       showPanelStatus('Clearing booking...', false);
       try {
-        await loadSeatsQuietly();
-        delete seats[selectedSeat];
-        const serialized = serializeSeats(seats);
-        await persistSeats(serialized);
+        const resName = await fetch(`${API_URL}/UpdateValue/${APP_KEY}/${STORAGE_KEY}_${selectedSeat}/%20`, {
+          method: 'POST',
+          headers: { 'Content-Length': '0' }
+        });
 
+        // Get latest list, remove booking, save back
+        let bookedNums = [];
+        const resList = await fetch(`${API_URL}/GetValue/${APP_KEY}/${STORAGE_KEY}_list`);
+        if (resList.ok) {
+          let listStr = await resList.json();
+          if (listStr.startsWith('"') && listStr.endsWith('"')) {
+            listStr = listStr.slice(1, -1);
+          }
+          if (listStr && listStr !== '[]' && listStr !== '{}') {
+            bookedNums = listStr.split('_').map(Number).filter(n => !isNaN(n) && n > 0);
+          }
+        }
+        
+        bookedNums = bookedNums.filter(n => n !== selectedSeat);
+        bookedNums.sort((a, b) => a - b);
+        const newListStr = bookedNums.join('_') || '[]';
+        
+        const resUpdateList = await fetch(`${API_URL}/UpdateValue/${APP_KEY}/${STORAGE_KEY}_list/${encodeURIComponent(newListStr)}`, {
+          method: 'POST',
+          headers: { 'Content-Length': '0' }
+        });
+        if (!resUpdateList.ok) {
+          throw new Error("HTTP error updating list: " + resUpdateList.status);
+        }
+
+        delete seats[selectedSeat];
         selectedSeat = null;
         renderRows();
         renderPanel();
